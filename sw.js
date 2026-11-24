@@ -1,5 +1,5 @@
 /* Service worker do Foco: cache offline + checagem de lembretes */
-const CACHE = "foco-static-v4";
+const CACHE = "foco-static-v5";
 const ASSETS = [
   "./",
   "./index.html",

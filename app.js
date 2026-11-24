@@ -8,6 +8,9 @@
   const MIN_REWARD_MINUTES = 2; /* abaixo disso, concluir não rende XP e a árvore não cresce */
   const LAP_MINUTES = 180;
   const LAP_MS = LAP_MINUTES * 60 * 1000;
+  const LOCK_WAIT_MS = 600; /* espera o IdleDetector / blur classificarem o motivo do hidden */
+  const BLUR_WINDOW_MS = 500;
+  const VISIBLE_SETTLE_MS = 200;
   const DAY_LABELS = ["D", "S", "T", "Q", "Q", "S", "S"];
   const ICS_DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
   const MONTHS = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
@@ -25,7 +28,7 @@
 
   const DEFAULT_STATE = () => ({
     version: 1,
-    settings: { strictMode: true, sound: true, theme: "auto", notifyOnComplete: true },
+    settings: { strictMode: true, sound: true, theme: "auto", notifyOnComplete: true, keepScreenOn: true, detectScreenLock: true },
     profile: { xp: 0, coins: 0, totalMinutes: 0, totalSessions: 0, currentStreak: 0, bestStreak: 0, lastFocusDate: null },
     sessions: [],
     rewards: [],
@@ -40,6 +43,12 @@
   let tickTimer = null;
   let reminderTimer = null;
   let wakeLock = null;
+  let idleDetector = null;
+  let idleAbort = null;
+  let lastScreenState = null; /* "locked" | "unlocked" | null */
+  let lastBlurAt = 0;
+  let classifyTimer = null;
+  let visibleSettleTimer = null;
   let audioCtx = null;
   let dialDragging = false;
   let pendingMinutes = 25;
@@ -305,6 +314,7 @@
     return p.currentStreak;
   }
   async function requestWakeLock() {
+    if (!state.settings.keepScreenOn) { await releaseWakeLock(); return; }
     try { if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen"); }
     catch (e) { wakeLock = null; }
   }
@@ -319,13 +329,14 @@
     const variant = TREE_VARIANTS[Math.floor(Math.random() * TREE_VARIANTS.length)];
     state.activeSession = {
       id: uid(), startedAt: Date.now(), plannedMinutes: 0, subject, variant,
-      status: "running", lastHeartbeat: Date.now(), hiddenAt: null, pausedAt: null, pauseTotal: 0,
+      status: "running", lastHeartbeat: Date.now(), hiddenAt: null, hiddenReason: null, pausedAt: null, pauseTotal: 0,
     };
     if (subject) {
       state.recentSubjects = [subject, ...state.recentSubjects.filter((s) => s !== subject)].slice(0, 10);
     }
     saveState();
     requestWakeLock();
+    ensureIdleWatch(true);
     getAudio();
     ensureNotifyPerm();
     startTicking();
@@ -361,8 +372,10 @@
     if (!s || s.status !== "running") return;
     if (s.pausedAt) return;
     if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
+    clearClassifyTimers();
     s.pausedAt = Date.now();
     s.hiddenAt = null;
+    s.hiddenReason = null;
     s.lastHeartbeat = s.pausedAt;
     saveState();
     schedulePauseWatch();
@@ -393,6 +406,8 @@
       subject: s.subject || "", status: "failed", variant: s.variant, reason: reason || "left",
     });
     state.activeSession = { ...s, status: "failed", endedAt: Date.now(), failReason: reason };
+    clearClassifyTimers();
+    if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
     saveState();
     releaseWakeLock();
     playFail();
@@ -426,6 +441,7 @@
     state.activeSession = { ...s, status: "completed", endedAt: Date.now(), xp: reward.xp, coins: reward.coins, tooShort };
     clearPauseWatch();
     if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
+    clearClassifyTimers();
     saveState();
     releaseWakeLock();
     if (tooShort) {
@@ -468,39 +484,201 @@
     if (now - (onTick._saved || 0) > 2000) { onTick._saved = now; saveState(); }
     renderFocoTimeOnly();
   }
+  function clearClassifyTimers() {
+    if (classifyTimer) { clearTimeout(classifyTimer); classifyTimer = null; }
+    if (visibleSettleTimer) { clearTimeout(visibleSettleTimer); visibleSettleTimer = null; }
+  }
+  function idleApiAvailable() {
+    return typeof IdleDetector === "function";
+  }
+  function currentScreenLocked() {
+    if (lastScreenState === "locked") return true;
+    if (idleDetector && idleDetector.screenState === "locked") return true;
+    return false;
+  }
+  function blurredAroundHidden(hiddenAt) {
+    const t = hiddenAt || (state.activeSession && state.activeSession.hiddenAt) || Date.now();
+    if (!lastBlurAt) return false;
+    /* Só conta blur ANTES (ou quase junto) do hidden: na troca de app o foco some primeiro.
+       Um blur depois do hidden é comum quando a tela apaga, e não deve virar "saiu do app". */
+    return lastBlurAt <= t + 50 && (t - lastBlurAt) <= BLUR_WINDOW_MS;
+  }
+  function markHiddenReason(reason) {
+    const s = state.activeSession;
+    if (!s || s.status !== "running") return;
+    s.hiddenReason = reason;
+    if (reason === "locked") {
+      if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
+    }
+    saveState();
+  }
+  function maybeFailForLeave() {
+    const cur = state.activeSession;
+    if (!cur || cur.status !== "running" || !document.hidden) return false;
+    if (!state.settings.strictMode || cur.pausedAt) return false;
+    if (currentScreenLocked() || cur.hiddenReason === "locked") {
+      markHiddenReason("locked");
+      return false;
+    }
+    failSession("left");
+    return true;
+  }
+  function startLeaveGrace() {
+    const s = state.activeSession;
+    if (!s || s.status !== "running" || s.pausedAt || !state.settings.strictMode) return;
+    if (currentScreenLocked()) { markHiddenReason("locked"); return; }
+    markHiddenReason("away");
+    if (window._focoLeaveTimer) clearTimeout(window._focoLeaveTimer);
+    window._focoLeaveTimer = setTimeout(() => { maybeFailForLeave(); }, GRACE_MS);
+  }
+  function refineHiddenReason() {
+    classifyTimer = null;
+    const s = state.activeSession;
+    if (!s || s.status !== "running" || s.pausedAt) return;
+    if (!document.hidden && !s.hiddenAt) return;
+    if (currentScreenLocked()) { markHiddenReason("locked"); return; }
+    /* IdleDetector rodando e tela desbloqueada: é troca de app, não lock. */
+    if (idleDetector && lastScreenState === "unlocked") { startLeaveGrace(); return; }
+    if (blurredAroundHidden(s.hiddenAt)) { startLeaveGrace(); return; }
+    /* Sem API e sem blur recente: no Android costuma ser tela apagada / botão de ligar. */
+    markHiddenReason("locked");
+  }
+  function handleIdleChange() {
+    if (!idleDetector) return;
+    const scr = idleDetector.screenState;
+    if (scr === "locked" || scr === "unlocked") lastScreenState = scr;
+    const s = state.activeSession;
+    if (!s || s.status !== "running") return;
+    if (scr === "locked" && (document.hidden || s.hiddenAt)) markHiddenReason("locked");
+  }
+  function stopIdleWatch() {
+    try { if (idleAbort) idleAbort.abort(); } catch (e) {}
+    idleAbort = null;
+    idleDetector = null;
+    lastScreenState = null;
+  }
+  async function ensureIdleWatch(requestIfNeeded) {
+    if (!state.settings.detectScreenLock) { stopIdleWatch(); return false; }
+    if (!idleApiAvailable()) return false;
+    if (idleDetector) return true;
+    try {
+      let perm = "prompt";
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const st = await navigator.permissions.query({ name: "idle-detection" });
+          perm = st.state;
+        }
+      } catch (e) {}
+      if (perm !== "granted") {
+        if (!requestIfNeeded) return false;
+        if (typeof IdleDetector.requestPermission === "function") {
+          perm = await IdleDetector.requestPermission();
+        }
+      }
+      if (perm !== "granted") return false;
+      idleAbort = new AbortController();
+      idleDetector = new IdleDetector();
+      idleDetector.addEventListener("change", handleIdleChange);
+      await idleDetector.start({ threshold: 60000, signal: idleAbort.signal });
+      if (idleDetector.screenState === "locked" || idleDetector.screenState === "unlocked") {
+        lastScreenState = idleDetector.screenState;
+      }
+      return true;
+    } catch (e) {
+      stopIdleWatch();
+      return false;
+    }
+  }
+  function installTestIdleDetector(initial) {
+    stopIdleWatch();
+    const startState = (initial && initial.screenState) || "unlocked";
+    lastScreenState = startState;
+    const det = {
+      userState: "active",
+      screenState: startState,
+      _fn: null,
+      addEventListener: function (ev, fn) { if (ev === "change") this._fn = fn; },
+      start: function () { return Promise.resolve(); },
+    };
+    idleDetector = det;
+    return {
+      setScreen: function (scr) {
+        det.screenState = scr;
+        lastScreenState = scr;
+        handleIdleChange();
+      },
+      get: function () { return det; },
+    };
+  }
+  function onBecameVisible() {
+    visibleSettleTimer = null;
+    const s = state.activeSession;
+    if (!s || s.status !== "running") return;
+    if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
+    if (classifyTimer) { clearTimeout(classifyTimer); classifyTimer = null; }
+    if (enforcePauseLimit()) return;
+    const reason = s.hiddenReason;
+    const hiddenAt = s.hiddenAt;
+    /* Se um evento "locked" atrasado chegou no resume, prevalece. */
+    if (currentScreenLocked() || reason === "locked") {
+      s.hiddenAt = null;
+      s.hiddenReason = null;
+      s.lastHeartbeat = Date.now();
+      saveState();
+    } else if (hiddenAt && state.settings.strictMode && !s.pausedAt) {
+      const away = Date.now() - hiddenAt;
+      s.hiddenAt = null;
+      s.hiddenReason = null;
+      if (away > GRACE_MS) { failSession("left"); return; }
+      s.lastHeartbeat = Date.now();
+      saveState();
+    } else {
+      s.hiddenAt = null;
+      s.hiddenReason = null;
+      if (!s.pausedAt) s.lastHeartbeat = Date.now();
+      saveState();
+    }
+    if (s.pausedAt) schedulePauseWatch();
+    else requestWakeLock();
+  }
   function handleVisibility() {
     const s = state.activeSession;
     if (!s || s.status !== "running") return;
     if (document.hidden) {
+      if (visibleSettleTimer) { clearTimeout(visibleSettleTimer); visibleSettleTimer = null; }
       s.hiddenAt = Date.now();
-      if (s.pausedAt) s.lastHeartbeat = Date.now();
-      saveState();
-      // Leaving while paused must not wither the tree — only running time is watched.
-      if (state.settings.strictMode && !s.pausedAt) {
-        if (window._focoLeaveTimer) clearTimeout(window._focoLeaveTimer);
-        window._focoLeaveTimer = setTimeout(() => {
-          const cur = state.activeSession;
-          if (cur && cur.status === "running" && document.hidden && state.settings.strictMode && !cur.pausedAt) {
-            failSession("left");
-          }
-        }, GRACE_MS);
-      }
-    } else {
-      if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
-      if (enforcePauseLimit()) return;
-      if (s.hiddenAt && state.settings.strictMode && !s.pausedAt) {
-        const away = Date.now() - s.hiddenAt;
-        s.hiddenAt = null;
-        if (away > GRACE_MS) failSession("left");
-        else { s.lastHeartbeat = Date.now(); saveState(); }
-      } else {
-        s.hiddenAt = null;
-        if (!s.pausedAt) s.lastHeartbeat = Date.now();
+      if (s.pausedAt) {
+        s.lastHeartbeat = Date.now();
         saveState();
+        return;
       }
-      if (s.pausedAt) schedulePauseWatch();
-      else requestWakeLock();
+      if (currentScreenLocked()) {
+        markHiddenReason("locked");
+        return;
+      }
+      /* Classificação provisória (sobrevive se o processo morrer antes do LOCK_WAIT). */
+      if (blurredAroundHidden(s.hiddenAt)) s.hiddenReason = "away";
+      else s.hiddenReason = "locked";
+      saveState();
+      if (!state.settings.strictMode) return;
+      if (classifyTimer) clearTimeout(classifyTimer);
+      classifyTimer = setTimeout(refineHiddenReason, LOCK_WAIT_MS);
+    } else {
+      /* Espera um instante para eventos IdleDetector enfileirados no freeze/resume chegarem. */
+      if (visibleSettleTimer) clearTimeout(visibleSettleTimer);
+      visibleSettleTimer = setTimeout(onBecameVisible, VISIBLE_SETTLE_MS);
     }
+  }
+  function handleFreeze() {
+    const s = state.activeSession;
+    if (!s || s.status !== "running") return;
+    if (!s.hiddenAt) s.hiddenAt = Date.now();
+    if (!s.pausedAt && state.settings.strictMode) refineHiddenReason();
+    saveState();
+  }
+  function handleResume() {
+    /* O estado da tela pode ser entregue aqui, antes do visibilitychange visible. */
+    handleIdleChange();
   }
   function recoverActiveOnLoad() {
     const s = state.activeSession;
@@ -508,6 +686,16 @@
     const now = Date.now();
     // Wall-clock pause limit must be checked first, even after the app was closed or the phone slept.
     if (enforcePauseLimit(now)) return;
+    if (s.hiddenReason === "locked" || currentScreenLocked()) {
+      s.hiddenAt = null;
+      s.hiddenReason = null;
+      s.lastHeartbeat = now;
+      saveState();
+      startTicking();
+      if (s.pausedAt) schedulePauseWatch();
+      else requestWakeLock();
+      return;
+    }
     const gap = now - (s.lastHeartbeat || s.startedAt);
     if (state.settings.strictMode && !s.pausedAt && gap > GRACE_MS + 1000) {
       failSession("left");
@@ -811,7 +999,7 @@
       unit = "de foco";
       sub = sess.subject ? sess.subject : (paused ? "Foco pausado" : "Foco em andamento");
       if (paused) status = `<span class="status-chip warn">Pausado</span>`;
-      else if (state.settings.strictMode) status = `<span class="status-chip">Modo rigoroso · não saia do app</span>`;
+      else if (state.settings.strictMode) status = `<span class="status-chip">Modo rigoroso · não troque de app</span>`;
       else status = `<span class="status-chip">Modo flexível</span>`;
     } else if (ended) {
       variant = sess.variant;
@@ -1297,6 +1485,18 @@
     toast("Recompensa salva.");
   }
 
+  function idleLockHelp(s) {
+    if (!s.detectScreenLock) {
+      return "Desligado. Bloquear a tela pode murchar a árvore no modo rigoroso, a menos que o app perceba pelo foco da janela (imperfeito).";
+    }
+    if (!idleApiAvailable()) {
+      return "Este navegador não tem a API de tela bloqueada (IdleDetector). O app usa um fallback: se a janela perder o foco e em seguida ficar oculta, conta como troca de app; se a tela apagar sem isso, normalmente não murcha. Não é 100% preciso.";
+    }
+    if (idleDetector && lastScreenState) {
+      return "Permissão ativa. O Chrome avisa quando a tela está bloqueada, e isso não murcha a árvore. Trocar de app no modo rigoroso continua valendo.";
+    }
+    return "No Chrome para Android (PWA instalado inclusive), o app pode pedir permissão para saber se a tela está bloqueada. Sem isso, usa um fallback menos preciso. Toque no interruptor de novo se o Chrome ainda não pediu permissão.";
+  }
   function renderAjustes() {
     const root = $("#view-ajustes");
     if (!root) return;
@@ -1306,12 +1506,20 @@
     root.innerHTML = `
       <div class="card">
         <div class="setting-row">
-          <div><h3>Modo rigoroso</h3><p>Sair do app por mais de 10s, com o timer rodando, murcha a árvore. Pode pausar; se a pausa passar de 1 hora, a árvore também murcha.</p></div>
+          <div><h3>Modo rigoroso</h3><p>Trocar de app por mais de 10s, com o timer rodando, murcha a árvore. Apagar ou bloquear a tela não conta como sair (veja abaixo). Pode pausar; se a pausa passar de 1 hora, a árvore também murcha.</p></div>
           <button type="button" class="toggle" id="set-strict" role="switch" aria-checked="${s.strictMode ? "true" : "false"}"></button>
         </div>
         <div class="setting-row">
           <div><h3>Modo flexível</h3><p>Pode sair do app com o timer rodando sem murchar. A pausa também existe, com o mesmo limite de 1 hora.</p></div>
           <button type="button" class="toggle" id="set-flex" role="switch" aria-checked="${!s.strictMode ? "true" : "false"}"></button>
+        </div>
+        <div class="setting-row">
+          <div><h3>Manter tela ligada</h3><p>Impede que a tela apague sozinha durante uma sessão (economia de bateria menor). Se você apertar o botão de ligar, a tela apaga mesmo assim.</p></div>
+          <button type="button" class="toggle" id="set-wakelock" role="switch" aria-checked="${s.keepScreenOn ? "true" : "false"}"></button>
+        </div>
+        <div class="setting-row">
+          <div><h3>Detectar tela bloqueada</h3><p>${idleLockHelp(s)}</p></div>
+          <button type="button" class="toggle" id="set-idlelock" role="switch" aria-checked="${s.detectScreenLock ? "true" : "false"}"></button>
         </div>
         <div class="setting-row">
           <div><h3>Som</h3><p>Toques ao concluir, murchar ou no lembrete.</p></div>
@@ -1359,6 +1567,28 @@
       renderAjustes();
       renderFoco();
     };
+    bindToggle("#set-wakelock", (on) => {
+      state.settings.keepScreenOn = on;
+      saveState();
+      const sess = state.activeSession;
+      if (sess && sess.status === "running" && !sess.pausedAt) {
+        if (on) requestWakeLock();
+        else releaseWakeLock();
+      }
+    });
+    bindToggle("#set-idlelock", async (on) => {
+      state.settings.detectScreenLock = on;
+      saveState();
+      if (!on) { stopIdleWatch(); renderAjustes(); return; }
+      const ok = await ensureIdleWatch(true);
+      if (!ok) {
+        if (!idleApiAvailable()) toast("Este navegador não informa se a tela está bloqueada. O app usa um fallback (menos preciso).");
+        else toast("Permissão negada ou indisponível. O app tenta distinguir pelo foco da janela, mas não é perfeito.");
+      } else {
+        toast("Pronto. Com a tela bloqueada, a árvore não murcha.");
+      }
+      renderAjustes();
+    });
     bindToggle("#set-sound", (on) => { state.settings.sound = on; saveState(); });
     bindToggle("#set-notif", async (on) => {
       state.settings.notifyOnComplete = on;
@@ -1608,10 +1838,15 @@
   function bindShell() {
     $$(".tabbar button").forEach((b) => b.addEventListener("click", () => showTab(b.getAttribute("data-tab"))));
     document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("blur", () => { lastBlurAt = Date.now(); }, true);
+    document.addEventListener("freeze", handleFreeze);
+    document.addEventListener("resume", handleResume);
     window.addEventListener("pagehide", () => {
       if (state.activeSession && state.activeSession.status === "running") {
-        state.activeSession.lastHeartbeat = Date.now();
-        state.activeSession.hiddenAt = state.activeSession.hiddenAt || Date.now();
+        const sess = state.activeSession;
+        sess.lastHeartbeat = Date.now();
+        sess.hiddenAt = sess.hiddenAt || Date.now();
+        if (!sess.pausedAt && state.settings.strictMode) refineHiddenReason();
         saveState();
       }
     });
@@ -1634,6 +1869,7 @@
     state = loadState();
     applyTheme();
     bindShell();
+    ensureIdleWatch(false);
     recoverActiveOnLoad();
     render();
     checkMissedReminders();
@@ -1644,8 +1880,10 @@
   window.FocoApp = {
     init, getState: () => state, setState: (s) => { state = s; saveState(); if (enforcePauseLimit()) return; render(); if (state.activeSession && state.activeSession.status === "running") { startTicking(); if (state.activeSession.pausedAt) schedulePauseWatch(); } },
     showTab, startSession, failSession, completeSession, pauseSession, resumeSession,
-    recoverActiveOnLoad, enforcePauseLimit,
-    STORAGE_KEY, todayKey, levelFromXp, PAUSE_LIMIT_MS, GRACE_MS,
+    recoverActiveOnLoad, enforcePauseLimit, handleVisibility, maybeFailForLeave,
+    ensureIdleWatch, stopIdleWatch, installTestIdleDetector, currentScreenLocked, refineHiddenReason,
+    resetPresenceSignals: function () { lastBlurAt = 0; },
+    STORAGE_KEY, todayKey, levelFromXp, PAUSE_LIMIT_MS, GRACE_MS, LOCK_WAIT_MS, BLUR_WINDOW_MS, VISIBLE_SETTLE_MS,
     MIN_REWARD_MINUTES, LAP_MINUTES, LAP_MS, fmtElapsed, renderDialSvg, growthStageFromMinutes,
   };
 
