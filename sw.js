@@ -1,14 +1,14 @@
 /* Service worker do Foco: cache offline + checagem de lembretes */
-const CACHE = "foco-static-v2";
+const CACHE = "foco-static-v3";
 const ASSETS = [
   "./",
   "./index.html",
-  "./css/styles.css",
-  "./js/app.js",
+  "./styles.css",
+  "./app.js",
   "./manifest.json",
-  "./icons/icon-192.png",
-  "./icons/icon-512.png",
-  "./icons/icon-180.png",
+  "./icon-192.png",
+  "./icon-512.png",
+  "./icon-180.png",
 ];
 
 self.addEventListener("install", (event) => {
@@ -100,7 +100,7 @@ async function checkRemindersFromSW() {
     if (lastShown[key]) continue;
     const title = r.type === "journal" ? "Anotação do dia" : "Hora de focar";
     const body = r.message || (r.type === "journal" ? "Que tal escrever a anotação do dia?" : "Hora de estudar!");
-    await self.registration.showNotification(title, { body, tag: "foco-rem-" + r.id, icon: "icons/icon-192.png" });
+    await self.registration.showNotification(title, { body, tag: "foco-rem-" + r.id, icon: "icon-192.png" });
   }
 }
 

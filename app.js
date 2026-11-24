@@ -242,7 +242,7 @@
   }
   function showNotification(title, body, tag) {
     if (!("Notification" in window) || Notification.permission !== "granted") return;
-    const opts = { body: body || "", tag: tag || "foco", icon: "icons/icon-192.png", badge: "icons/icon-192.png" };
+    const opts = { body: body || "", tag: tag || "foco", icon: "icon-192.png", badge: "icon-192.png" };
     try {
       if (navigator.serviceWorker && navigator.serviceWorker.controller) {
         navigator.serviceWorker.ready.then((reg) => reg.showNotification(title, opts)).catch(() => {
