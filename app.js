@@ -5,9 +5,9 @@
   const STORAGE_KEY = "foco-app-v1";
   const GRACE_MS = 10000;
   const PAUSE_LIMIT_MS = 60 * 60 * 1000;
-  const MIN_MINUTES = 5;
-  const MAX_MINUTES = 180;
-  const STEP_MINUTES = 5;
+  const MIN_REWARD_MINUTES = 2; /* abaixo disso, concluir não rende XP e a árvore não cresce */
+  const LAP_MINUTES = 180;
+  const LAP_MS = LAP_MINUTES * 60 * 1000;
   const DAY_LABELS = ["D", "S", "T", "Q", "Q", "S", "S"];
   const ICS_DAYS = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
   const MONTHS = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
@@ -74,13 +74,20 @@
   }
   function pad(n) { return String(n).padStart(2, "0"); }
   function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-  function snapMinutes(m) {
-    m = Math.round(Number(m) / STEP_MINUTES) * STEP_MINUTES;
-    return clamp(m, MIN_MINUTES, MAX_MINUTES);
-  }
   function fmtMMSS(ms) {
-    const s = Math.max(0, Math.ceil(ms / 1000));
+    const s = Math.max(0, Math.floor(ms / 1000));
     return pad(Math.floor(s / 60)) + ":" + pad(s % 60);
+  }
+  function fmtElapsed(ms) {
+    const s = Math.max(0, Math.floor(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return h + ":" + pad(m) + ":" + pad(sec);
+    return pad(m) + ":" + pad(sec);
+  }
+  function sessionMinutes(sess, now) {
+    return Math.floor(sessionElapsedMs(sess, now) / 60000);
   }
 
   function loadState() {
@@ -260,13 +267,16 @@
     if (sess.pausedAt) pause += now - sess.pausedAt;
     return Math.max(0, now - sess.startedAt - pause);
   }
-  function sessionRemainingMs(sess, now) {
-    return Math.max(0, sess.plannedMinutes * 60000 - sessionElapsedMs(sess, now));
+  function growthStageFromMinutes(min) {
+    if (min < 2) return 0;
+    if (min < 10) return 1;
+    if (min < 25) return 2;
+    if (min < 45) return 3;
+    if (min < 90) return 4;
+    return 5;
   }
   function growthStage(sess, now) {
-    const p = sessionElapsedMs(sess, now) / (sess.plannedMinutes * 60000);
-    if (p >= 1) return 5;
-    return clamp(Math.floor(p * 6), 0, 5);
+    return growthStageFromMinutes(sessionElapsedMs(sess, now) / 60000);
   }
   function xpForSession(minutes, streak) {
     let xp = minutes * 10;
@@ -305,11 +315,10 @@
 
   function startSession() {
     if (state.activeSession && state.activeSession.status === "running") return;
-    const minutes = snapMinutes(pendingMinutes);
     const subject = (pendingSubject || "").trim();
     const variant = TREE_VARIANTS[Math.floor(Math.random() * TREE_VARIANTS.length)];
     state.activeSession = {
-      id: uid(), startedAt: Date.now(), plannedMinutes: minutes, subject, variant,
+      id: uid(), startedAt: Date.now(), plannedMinutes: 0, subject, variant,
       status: "running", lastHeartbeat: Date.now(), hiddenAt: null, pausedAt: null, pauseTotal: 0,
     };
     if (subject) {
@@ -393,31 +402,46 @@
   function completeSession() {
     const s = state.activeSession;
     if (!s || s.status !== "running") return;
-    const minutes = s.plannedMinutes;
+    const minutes = sessionMinutes(s);
+    const tooShort = minutes < MIN_REWARD_MINUTES;
     const dateKey = todayKey();
-    const streak = updateStreakOnComplete(dateKey);
-    const reward = xpForSession(minutes, streak);
-    const prevLevel = levelFromXp(state.profile.xp).level;
-    state.profile.xp += reward.xp;
-    state.profile.coins += reward.coins;
-    state.profile.totalMinutes += minutes;
-    state.profile.totalSessions += 1;
-    const newLevel = levelFromXp(state.profile.xp).level;
+    let reward = { xp: 0, coins: 0, bonus: 0 };
+    let prevLevel = levelFromXp(state.profile.xp).level;
+    let newLevel = prevLevel;
+    if (!tooShort) {
+      const streak = updateStreakOnComplete(dateKey);
+      reward = xpForSession(minutes, streak);
+      prevLevel = levelFromXp(state.profile.xp).level;
+      state.profile.xp += reward.xp;
+      state.profile.coins += reward.coins;
+      state.profile.totalMinutes += minutes;
+      state.profile.totalSessions += 1;
+      newLevel = levelFromXp(state.profile.xp).level;
+    }
     state.sessions.unshift({
       id: s.id, startedAt: s.startedAt, endedAt: Date.now(),
       plannedMinutes: minutes, actualMinutes: minutes, subject: s.subject || "",
-      status: "completed", variant: s.variant, xp: reward.xp, coins: reward.coins,
+      status: "completed", variant: s.variant, xp: reward.xp, coins: reward.coins, tooShort,
     });
-    state.activeSession = { ...s, status: "completed", endedAt: Date.now(), xp: reward.xp, coins: reward.coins };
+    state.activeSession = { ...s, status: "completed", endedAt: Date.now(), xp: reward.xp, coins: reward.coins, tooShort };
+    clearPauseWatch();
+    if (window._focoLeaveTimer) { clearTimeout(window._focoLeaveTimer); window._focoLeaveTimer = null; }
     saveState();
     releaseWakeLock();
-    playSuccess();
-    vibrate([40, 40, 80, 40, 120]);
-    if (state.settings.notifyOnComplete) {
-      showNotification("Sessão concluída! 🌳", (s.subject ? s.subject + " · " : "") + minutes + " min · +" + reward.xp + " XP · +" + reward.coins + " moedas", "foco-done");
+    if (tooShort) {
+      toast("Muito curto — foque pelo menos " + MIN_REWARD_MINUTES + " minutos para a árvore crescer e ganhar XP.");
+      if (state.settings.notifyOnComplete) {
+        showNotification("Sessão muito curta", "Foque pelo menos " + MIN_REWARD_MINUTES + " minutos para ganhar XP.", "foco-short");
+      }
+    } else {
+      playSuccess();
+      vibrate([40, 40, 80, 40, 120]);
+      if (state.settings.notifyOnComplete) {
+        showNotification("Sessão concluída! 🌳", (s.subject ? s.subject + " · " : "") + minutes + " min · +" + reward.xp + " XP · +" + reward.coins + " moedas", "foco-done");
+      }
     }
     render();
-    if (newLevel > prevLevel) showLevelUp(prevLevel, newLevel);
+    if (!tooShort && newLevel > prevLevel) showLevelUp(prevLevel, newLevel);
   }
   function clearActive() {
     state.activeSession = null;
@@ -441,7 +465,6 @@
     }
     const now = Date.now();
     s.lastHeartbeat = now;
-    if (sessionRemainingMs(s, now) <= 0) { completeSession(); return; }
     if (now - (onTick._saved || 0) > 2000) { onTick._saved = now; saveState(); }
     renderFocoTimeOnly();
   }
@@ -490,7 +513,6 @@
       failSession("left");
       return;
     }
-    if (sessionRemainingMs(s, now) <= 0 && !s.pausedAt) { completeSession(); return; }
     startTicking();
     if (s.pausedAt) schedulePauseWatch();
     else requestWakeLock();
@@ -498,21 +520,21 @@
 
   function minutesSince(ts, filterFn) {
     return state.sessions.reduce((acc, sess) => {
-      if (sess.status !== "completed") return acc;
+      if (sess.status !== "completed" || sess.tooShort) return acc;
       if (ts && sess.endedAt <= ts) return acc;
       if (filterFn && !filterFn(sess)) return acc;
       return acc + (sess.actualMinutes || sess.plannedMinutes || 0);
     }, 0);
   }
   function sessionsSince(ts) {
-    return state.sessions.filter((sess) => sess.status === "completed" && (!ts || sess.endedAt > ts)).length;
+    return state.sessions.filter((sess) => sess.status === "completed" && !sess.tooShort && (!ts || sess.endedAt > ts)).length;
   }
   function bestSessionSince(ts) {
     let best = 0;
     state.sessions.forEach((sess) => {
-      if (sess.status !== "completed") return;
+      if (sess.status !== "completed" || sess.tooShort) return;
       if (ts && sess.endedAt <= ts) return;
-      best = Math.max(best, sess.actualMinutes || sess.plannedMinutes || 0);
+      best = Math.max(best, sess.actualMinutes || 0);
     });
     return best;
   }
@@ -707,16 +729,6 @@
     toast("Arquivo de calendário baixado. Importe no Calendário ou Relógio para ter um alarme confiável.");
   }
 
-  function minutesToAngle(m) { return (clamp(m, 0, MAX_MINUTES) / MAX_MINUTES) * 360; }
-  function angleToMinutes(deg) { return snapMinutes((deg / 360) * MAX_MINUTES); }
-  function eventAngle(e, el) {
-    const rect = el.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const pt = e.touches && e.touches[0] ? e.touches[0] : (e.changedTouches && e.changedTouches[0] ? e.changedTouches[0] : e);
-    const ang = Math.atan2(pt.clientY - cy, pt.clientX - cx);
-    return (ang * 180 / Math.PI + 90 + 360) % 360;
-  }
   function polar(cx, cy, r, deg) {
     const rad = (deg - 90) * Math.PI / 180;
     return { x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) };
@@ -729,51 +741,34 @@
     const large = sweep > 180 ? 1 : 0;
     return `M ${start.x} ${start.y} A ${r} ${r} 0 ${large} 1 ${end.x} ${end.y}`;
   }
-  function renderDialSvg(minutes, progress01, interactive) {
+  function renderDialSvg(elapsedMs) {
     const size = 200, cx = 100, cy = 100, r = 86;
-    const ang = minutesToAngle(minutes);
-    const remainAng = progress01 == null ? ang : (1 - progress01) * ang;
+    elapsedMs = Math.max(0, elapsedMs || 0);
+    const laps = Math.floor(elapsedMs / LAP_MS);
+    const frac = (elapsedMs % LAP_MS) / LAP_MS;
+    const ang = frac * 360;
+    const elapsedMin = elapsedMs / 60000;
     let ticks = "";
-    for (let m = 0; m < MAX_MINUTES; m += 15) {
-      const a = minutesToAngle(m);
+    for (let m = 0; m < LAP_MINUTES; m += 15) {
+      const a = (m / LAP_MINUTES) * 360;
       const p1 = polar(cx, cy, r - 9, a);
       const p2 = polar(cx, cy, r + 9, a);
       ticks += `<line class="ticks" x1="${p1.x.toFixed(2)}" y1="${p1.y.toFixed(2)}" x2="${p2.x.toFixed(2)}" y2="${p2.y.toFixed(2)}"/>`;
     }
-    const arc = remainAng > 0 ? `<path class="arc" d="${describeArc(cx, cy, r, 0, remainAng)}"/>` : "";
-    const knobPos = polar(cx, cy, r, remainAng);
-    const knob = interactive
-      ? `<circle class="knob" data-knob="1" cx="${knobPos.x.toFixed(2)}" cy="${knobPos.y.toFixed(2)}" r="9"/>`
-      : "";
-    return `<svg class="dial-svg" viewBox="0 0 ${size} ${size}" role="slider" aria-valuemin="${MIN_MINUTES}" aria-valuemax="${MAX_MINUTES}" aria-valuenow="${minutes}" aria-label="Duração do foco em minutos">
+    let layers = "";
+    if (laps >= 1) {
+      /* volta anterior completa (verde na 1ª, verde-escuro a partir da 2ª) */
+      const underClass = laps === 1 ? "arc" : "arc-lap1";
+      layers += `<circle class="${underClass}" cx="${cx}" cy="${cy}" r="${r}" fill="none"/>`;
+    }
+    if (ang > 0) {
+      const curClass = laps === 0 ? "arc" : (laps === 1 ? "arc-lap1" : "arc-lap2");
+      layers += `<path class="${curClass}" d="${describeArc(cx, cy, r, 0, ang)}"/>`;
+    }
+    return `<svg class="dial-svg" viewBox="0 0 ${size} ${size}" role="progressbar" aria-valuemin="0" aria-valuenow="${Math.floor(elapsedMin)}" aria-label="Tempo de foco">
       <circle class="track" cx="${cx}" cy="${cy}" r="${r}"/>
-      ${ticks}${arc}${knob}
+      ${ticks}${layers}
     </svg>`;
-  }
-  function bindDialEvents() {
-    const svg = $(".dial-svg");
-    if (!svg || svg.dataset.bound) return;
-    const running = state.activeSession && state.activeSession.status === "running";
-    if (running) return;
-    svg.dataset.bound = "1";
-    const onMove = (e) => {
-      if (!dialDragging) return;
-      e.preventDefault();
-      pendingMinutes = angleToMinutes(eventAngle(e, svg));
-      renderFoco();
-    };
-    const onUp = () => { dialDragging = false; };
-    const onDown = (e) => {
-      const sess = state.activeSession;
-      if (sess && (sess.status === "running" || sess.status === "completed" || sess.status === "failed")) return;
-      dialDragging = true;
-      pendingMinutes = angleToMinutes(eventAngle(e, svg));
-      renderFoco();
-    };
-    svg.addEventListener("pointerdown", (e) => { svg.setPointerCapture(e.pointerId); onDown(e); });
-    svg.addEventListener("pointermove", onMove);
-    svg.addEventListener("pointerup", onUp);
-    svg.addEventListener("pointercancel", onUp);
   }
 
   function render() {
@@ -801,22 +796,19 @@
     const running = sess && sess.status === "running";
     const ended = sess && (sess.status === "completed" || sess.status === "failed");
     const paused = running && sess.pausedAt;
-    let minutes = pendingMinutes;
-    let stage = 0, variant = "carvalho", withered = false, progress = 0;
-    let timeLabel = minutes + " min";
-    let unit = "minutos";
-    let sub = "Gire o círculo para escolher o tempo";
+    let stage = 0, variant = "carvalho", withered = false;
+    let elapsedMs = 0;
+    let timeLabel = "00:00";
+    let unit = "cronômetro";
+    let sub = "Toque em Plantar para começar. O tempo sobe a partir de zero.";
     let status = "";
 
     if (running) {
-      const rem = sessionRemainingMs(sess);
-      const elap = sessionElapsedMs(sess);
-      progress = clamp(elap / (sess.plannedMinutes * 60000), 0, 1);
-      minutes = sess.plannedMinutes;
+      elapsedMs = sessionElapsedMs(sess);
       stage = growthStage(sess);
       variant = sess.variant;
-      timeLabel = fmtMMSS(paused ? sessionRemainingMs(sess, sess.pausedAt) : rem);
-      unit = paused ? "restantes" : "restantes";
+      timeLabel = fmtElapsed(elapsedMs);
+      unit = "de foco";
       sub = sess.subject ? sess.subject : (paused ? "Foco pausado" : "Foco em andamento");
       if (paused) status = `<span class="status-chip warn">Pausado</span>`;
       else if (state.settings.strictMode) status = `<span class="status-chip">Modo rigoroso · não saia do app</span>`;
@@ -824,35 +816,39 @@
     } else if (ended) {
       variant = sess.variant;
       withered = sess.status === "failed";
-      stage = withered ? Math.max(1, growthStage(sess, sess.endedAt || Date.now())) : 5;
-      progress = withered ? clamp(sessionElapsedMs(sess, sess.endedAt) / (sess.plannedMinutes * 60000), 0, 1) : 1;
-      minutes = sess.plannedMinutes;
+      elapsedMs = sessionElapsedMs(sess, sess.endedAt || Date.now());
+      const mins = Math.floor(elapsedMs / 60000);
+      stage = withered ? Math.max(1, growthStageFromMinutes(mins)) : growthStageFromMinutes(mins);
       if (withered) {
         timeLabel = "Murchou"; unit = "";
         sub = (sess.failReason === "pause-timeout")
           ? "A pausa passou de 1 hora. A árvore não sobreviveu."
           : "Você saiu ou desistiu. A árvore não sobreviveu.";
         status = `<span class="status-chip fail">Sessão perdida</span>`;
+      } else if (sess.tooShort) {
+        timeLabel = fmtElapsed(elapsedMs);
+        unit = "muito curto";
+        sub = "Foque pelo menos " + MIN_REWARD_MINUTES + " minutos para a árvore crescer e ganhar XP.";
+        status = `<span class="status-chip warn">Muito curto</span>`;
       } else {
-        timeLabel = "Feito!"; unit = "+" + (sess.xp || 0) + " XP";
-        sub = (sess.subject ? sess.subject + " · " : "") + sess.plannedMinutes + " min";
+        timeLabel = fmtElapsed(elapsedMs);
+        unit = "+" + (sess.xp || 0) + " XP";
+        sub = (sess.subject ? sess.subject + " · " : "") + mins + " min";
         status = `<span class="status-chip">Árvore plantada</span>`;
       }
     }
 
-    const interactive = !running && !ended;
-    const countdown = running
-      ? `<div class="countdown-big"><span class="mm">${escapeHtml(timeLabel)}</span><span class="unit">${escapeHtml(unit)}</span></div>`
-      : `<div class="countdown-big"><span class="mm">${ended ? escapeHtml(timeLabel) : pendingMinutes}</span><span class="unit">${ended ? escapeHtml(unit) : "min"}</span></div>`;
+    const countdown = `<div class="countdown-big"><span class="mm">${escapeHtml(timeLabel)}</span><span class="unit">${escapeHtml(unit)}</span></div>`;
 
     let actions = "";
     if (running) {
       actions = `<div class="btn-row">
-        <button class="btn btn-danger" id="btn-desistir">Desistir</button>
         ${paused
           ? `<button class="btn btn-primary" style="margin-top:0" id="btn-continuar">Continuar</button>`
           : `<button class="btn btn-ghost" id="btn-pausar">Pausar</button>`}
-      </div>`;
+        <button class="btn btn-primary" style="margin-top:0" id="btn-concluir">Concluir</button>
+      </div>
+      <button class="btn btn-danger" id="btn-desistir" style="width:100%;margin-top:8px">Desistir</button>`;
     } else if (ended) {
       actions = `<button class="btn btn-primary" id="btn-nova">Plantar outra</button>`;
     } else {
@@ -875,7 +871,7 @@
         <div class="sun"></div>
         <div class="hills"></div>
         <div class="dial-stage" id="dial-stage">
-          ${renderDialSvg(minutes, running || ended ? progress : null, interactive)}
+          ${renderDialSvg(elapsedMs)}
           ${countdown}
           <div class="dial-center">
             <div class="tree-wrap ${running && !paused ? "sway" : ""}" id="tree-wrap">
@@ -896,7 +892,6 @@
       ${subjectBlock}
       ${actions}
     `;
-    bindDialEvents();
     bindFocoEvents();
   }
 
@@ -904,21 +899,19 @@
     const sess = state.activeSession;
     if (!sess || sess.status !== "running") { renderFoco(); return; }
     const paused = !!sess.pausedAt;
-    const rem = sessionRemainingMs(sess, paused ? sess.pausedAt : Date.now());
     const elap = sessionElapsedMs(sess);
-    const progress = clamp(elap / (sess.plannedMinutes * 60000), 0, 1);
     const mm = $(".countdown-big .mm");
     const unit = $(".countdown-big .unit");
-    if (mm) mm.textContent = fmtMMSS(rem);
-    if (unit) unit.textContent = "restantes";
+    if (mm) mm.textContent = fmtElapsed(elap);
+    if (unit) unit.textContent = "de foco";
     const pclock = $("#pause-clock");
     if (paused && pclock) pclock.textContent = fmtMMSS(pauseElapsedMs(sess));
     const svgHost = $(".dial-stage");
     if (svgHost) {
-      const old = svgHost.querySelector(".dial-svg");
+      const oldSvg = svgHost.querySelector(".dial-svg");
       const tmp = document.createElement("div");
-      tmp.innerHTML = renderDialSvg(sess.plannedMinutes, progress, false);
-      if (old && tmp.firstElementChild) old.replaceWith(tmp.firstElementChild);
+      tmp.innerHTML = renderDialSvg(elap);
+      if (oldSvg && tmp.firstElementChild) oldSvg.replaceWith(tmp.firstElementChild);
     }
     const stage = growthStage(sess);
     const wrap = $("#tree-wrap");
@@ -954,6 +947,8 @@
     if (pausar) pausar.addEventListener("click", pauseSession);
     const continuar = $("#btn-continuar");
     if (continuar) continuar.addEventListener("click", resumeSession);
+    const concluir = $("#btn-concluir");
+    if (concluir) concluir.addEventListener("click", completeSession);
     const nova = $("#btn-nova");
     if (nova) nova.addEventListener("click", () => { clearActive(); });
   }
@@ -969,7 +964,8 @@
     const forest = state.sessions.slice(0, 60);
     const cells = forest.map((s) => {
       const w = s.status === "failed";
-      return `<button class="forest-cell ${w ? "withered" : ""}" data-sess="${s.id}" title="${escapeHtml((s.subject || "Foco") + " · " + formatDateTime(s.startedAt))}">${treeSvg(w ? 3 : 5, s.variant, w)}</button>`;
+      const stg = w ? Math.max(1, growthStageFromMinutes(s.actualMinutes || 0)) : growthStageFromMinutes(s.actualMinutes || 0);
+      return `<button class="forest-cell ${w ? "withered" : ""}" data-sess="${s.id}" title="${escapeHtml((s.subject || "Foco") + " · " + formatDateTime(s.startedAt))}">${treeSvg(stg, s.variant, w)}</button>`;
     }).join("");
     const weekCols = week.map((d) => {
       const h = d.minutes ? Math.max(8, Math.round((d.minutes / Math.max(60, week.max)) * 80)) : 4;
@@ -986,11 +982,12 @@
     }).join("") : `<p class="forest-empty">Os assuntos das suas sessões aparecem aqui.</p>`;
     const hist = state.sessions.slice(0, 12).map((s) => {
       const w = s.status === "failed";
+      const stg = w ? Math.max(1, growthStageFromMinutes(s.actualMinutes || 0)) : growthStageFromMinutes(s.actualMinutes || 0);
       return `<div class="hist-item">
-        <div class="mini">${treeSvg(w ? 3 : 5, s.variant, w)}</div>
+        <div class="mini">${treeSvg(stg, s.variant, w)}</div>
         <div style="flex:1">
           <div class="when">${escapeHtml(s.subject || "Foco livre")} ${w ? '<span class="fail-dot">· murchou</span>' : '<span class="ok-dot">· concluída</span>'}</div>
-          <div class="meta">${formatDateTime(s.startedAt)} · ${w ? (s.actualMinutes + "/" + s.plannedMinutes) : s.plannedMinutes} min${s.xp ? " · +" + s.xp + " XP" : ""}</div>
+          <div class="meta">${formatDateTime(s.startedAt)} · ${s.actualMinutes || 0} min${s.tooShort ? " · muito curto" : (s.xp ? " · +" + s.xp + " XP" : "")}</div>
         </div>
       </div>`;
     }).join("") || `<p class="forest-empty">Plante sua primeira árvore na aba Foco.</p>`;
@@ -1037,8 +1034,8 @@
     for (let i = 0; i < 7; i++) {
       const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + mondayOff + i);
       const k = todayKey(d);
-      const minutes = state.sessions.filter((s) => s.status === "completed" && todayKey(s.startedAt) === k)
-        .reduce((a, s) => a + (s.actualMinutes || s.plannedMinutes), 0);
+      const minutes = state.sessions.filter((s) => s.status === "completed" && !s.tooShort && todayKey(s.startedAt) === k)
+        .reduce((a, s) => a + (s.actualMinutes || 0), 0);
       max = Math.max(max, minutes);
       days.push({ key: k, minutes, label: DAY_LABELS[d.getDay()], isToday: k === todayKey() });
     }
@@ -1048,9 +1045,9 @@
   function subjectStats() {
     const map = {};
     state.sessions.forEach((s) => {
-      if (s.status !== "completed") return;
+      if (s.status !== "completed" || s.tooShort) return;
       const name = s.subject || "Foco livre";
-      map[name] = (map[name] || 0) + (s.actualMinutes || s.plannedMinutes || 0);
+      map[name] = (map[name] || 0) + (s.actualMinutes || 0);
     });
     return Object.keys(map).map((subject) => ({ subject, minutes: map[subject] })).sort((a, b) => b.minutes - a.minutes);
   }
@@ -1058,12 +1055,13 @@
     const s = state.sessions.find((x) => x.id === id);
     if (!s) return;
     const w = s.status === "failed";
+    const stg = w ? Math.max(1, growthStageFromMinutes(s.actualMinutes || 0)) : growthStageFromMinutes(s.actualMinutes || 0);
     openModal(`
       <div class="grab"></div>
-      <div style="width:120px;margin:0 auto 8px">${treeSvg(w ? 3 : 5, s.variant, w)}</div>
+      <div style="width:120px;margin:0 auto 8px">${treeSvg(stg, s.variant, w)}</div>
       <h2 style="text-align:center">${escapeHtml(s.subject || "Foco livre")}</h2>
       <p class="timer-sub" style="text-align:center">${formatDateTime(s.startedAt)}</p>
-      <p style="text-align:center;margin-top:8px;font-weight:700">${w ? "Árvore murchou · " + s.actualMinutes + " de " + s.plannedMinutes + " min" : s.plannedMinutes + " min concluídos"}</p>
+      <p style="text-align:center;margin-top:8px;font-weight:700">${w ? "Árvore murchou · " + (s.actualMinutes || 0) + " min" : (s.tooShort ? (s.actualMinutes || 0) + " min — muito curto" : (s.actualMinutes || 0) + " min concluídos")}</p>
       ${s.xp ? `<p style="text-align:center;color:var(--ink-soft)">+${s.xp} XP · +${s.coins} moedas</p>` : ""}
       <button class="btn btn-primary" data-close>Fechar</button>
     `);
@@ -1078,7 +1076,7 @@
     const key = selectedNoteDay;
     const note = state.notes[key] || { text: "", updatedAt: null };
     const sess = sessionsOnDay(key);
-    const doneMin = sess.filter((s) => s.status === "completed").reduce((a, s) => a + (s.actualMinutes || s.plannedMinutes), 0);
+    const doneMin = sess.filter((s) => s.status === "completed" && !s.tooShort).reduce((a, s) => a + (s.actualMinutes || 0), 0);
     const failed = sess.filter((s) => s.status === "failed").length;
     const subjects = Array.from(new Set(sess.filter((s) => s.subject).map((s) => s.subject)));
     const y = calCursor.getFullYear();
@@ -1107,11 +1105,12 @@
     }
     const sessHtml = sess.length ? sess.map((s) => {
       const w = s.status === "failed";
+      const stg = w ? Math.max(1, growthStageFromMinutes(s.actualMinutes || 0)) : growthStageFromMinutes(s.actualMinutes || 0);
       return `<div class="hist-item">
-        <div class="mini">${treeSvg(w ? 3 : 5, s.variant, w)}</div>
+        <div class="mini">${treeSvg(stg, s.variant, w)}</div>
         <div style="flex:1">
-          <div class="when">${escapeHtml(s.subject || "Foco livre")} ${w ? '<span class="fail-dot">· murchou</span>' : '<span class="ok-dot">· concluída</span>'}</div>
-          <div class="meta">${new Date(s.startedAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })} · ${w ? s.actualMinutes + "/" + s.plannedMinutes : s.plannedMinutes} min</div>
+          <div class="when">${escapeHtml(s.subject || "Foco livre")} ${w ? '<span class="fail-dot">· murchou</span>' : (s.tooShort ? '<span class="fail-dot">· muito curto</span>' : '<span class="ok-dot">· concluída</span>')}</div>
+          <div class="meta">${new Date(s.startedAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })} · ${s.actualMinutes || 0} min</div>
         </div>
       </div>`;
     }).join("") : `<p class="forest-empty">Nenhuma sessão neste dia.</p>`;
@@ -1403,7 +1402,6 @@
     $("#btn-reset").addEventListener("click", () => {
       openConfirm("Apagar todos os dados?", "Sessões, floresta, recompensas, anotações e lembretes serão removidos deste aparelho.", () => {
         state = DEFAULT_STATE();
-        pendingMinutes = 25;
         pendingSubject = "";
         saveState();
         render();
@@ -1647,8 +1645,8 @@
     init, getState: () => state, setState: (s) => { state = s; saveState(); if (enforcePauseLimit()) return; render(); if (state.activeSession && state.activeSession.status === "running") { startTicking(); if (state.activeSession.pausedAt) schedulePauseWatch(); } },
     showTab, startSession, failSession, completeSession, pauseSession, resumeSession,
     recoverActiveOnLoad, enforcePauseLimit,
-    pendingMinutesSet: (m) => { pendingMinutes = snapMinutes(m); },
     STORAGE_KEY, todayKey, levelFromXp, PAUSE_LIMIT_MS, GRACE_MS,
+    MIN_REWARD_MINUTES, LAP_MINUTES, LAP_MS, fmtElapsed, renderDialSvg, growthStageFromMinutes,
   };
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

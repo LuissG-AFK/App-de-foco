@@ -965,3 +965,16 @@ html[data-theme="dark"] .forest-cell.withered { background: #3a3328; }
 }
 html[data-theme="dark"] .pause-panel .pause-clock,
 html[data-theme="dark"] .pause-panel .pause-label { color: var(--peach); }
+
+.dial-svg { pointer-events: none; }
+.dial-svg .arc-lap1 { stroke: #2d6a45; }
+.dial-svg .arc-lap2 { stroke: #163322; }
+html[data-theme="dark"] .dial-svg .arc-lap1 { stroke: #3d8a55; }
+html[data-theme="dark"] .dial-svg .arc-lap2 { stroke: #1a4a2c; }
+.dial-svg .arc,
+.dial-svg .arc-lap1,
+.dial-svg .arc-lap2 {
+  fill: none;
+  stroke-width: 14;
+  stroke-linecap: round;
+}
