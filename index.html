@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <meta name="theme-color" content="#4f9a5e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Foco">
+  <meta name="description" content="App pessoal de foco: plante uma árvore, suba de nível e defina suas próprias recompensas.">
+  <title>Foco</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="app-header">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" width="32" height="32" aria-hidden="true">
+          <rect width="32" height="32" rx="8" fill="#4f9a5e"/>
+          <ellipse cx="16" cy="26" rx="8" ry="2.2" fill="#3b7a49"/>
+          <path d="M16 25 V14" stroke="#8a5a32" stroke-width="2.4" stroke-linecap="round"/>
+          <circle cx="16" cy="12" r="7" fill="#c8ecc0"/>
+          <circle cx="11" cy="14" r="4" fill="#7fbf6b"/>
+          <circle cx="21" cy="14" r="4" fill="#3e8a4c"/>
+        </svg>
+        Foco
+      </div>
+      <div class="header-stats">
+        <div class="pill" title="Nível"><span class="ico">⭐</span><span id="hdr-level">Nv. 1</span></div>
+        <div class="pill" title="Moedas"><span class="ico">🪙</span><span id="hdr-coins">0</span></div>
+      </div>
+    </header>
+    <main>
+      <section id="view-foco" class="view active" hidden-off></section>
+      <section id="view-floresta" class="view"></section>
+      <section id="view-notas" class="view"></section>
+      <section id="view-recompensas" class="view"></section>
+      <section id="view-ajustes" class="view"></section>
+    </main>
+    <nav class="tabbar" aria-label="Navegação principal">
+      <button type="button" data-tab="foco" class="active"><span class="ti">🌱</span>Foco</button>
+      <button type="button" data-tab="floresta"><span class="ti">🌳</span>Floresta</button>
+      <button type="button" data-tab="notas"><span class="ti">📝</span>Notas</button>
+      <button type="button" data-tab="recompensas"><span class="ti">🎁</span>Prêmios</button>
+      <button type="button" data-tab="ajustes"><span class="ti">⚙️</span>Ajustes</button>
+    </nav>
+  </div>
+  <script src="js/app.js"></script>
+</body>
+</html>
